@@ -7,6 +7,57 @@ Hay dos familias de diseño para bases de datos transaccionales: la familia **LS
 ### 1. La Familia LSM-Tree (Log-Structured Merge-Tree) y componentes
 Pensada para cuando tienes **muchísimas escrituras** y no quieres ralentizar el disco buscando dónde escribir.
 
+```mermaid
+graph TD
+    subgraph CLIENT_LAYER[" Capa de Aplicación "]
+        Client["Cliente / API (Write / Read)"]
+    end
+
+    subgraph OS_RAM[" MEMORIA FÍSICA (RAM) - Acceso Ultrarrápido (Nanosegundos) "]
+        Memtable["Memtable (Árbol SkipList / Red-Black)<br/>Ordenado por clave en RAM<br/>[Dato fresco listo para consulta]"]
+        
+        subgraph IN_MEMORY_ACCEL[" Aceleradores de Búsqueda (En RAM) "]
+            BloomRam["Filtros de Bloom (Array de Bits)<br/>¿Está la clave en la SSTable N?<br/>0 = 'Definitivamente NO' | 1 = 'Tal vez'"]
+            SparseIdx["Índices Dispersos (Sparse Index)<br/>Punteros en RAM: [handbag -> Offset 0, handsome -> Offset 4096]"]
+        end
+    end
+
+    subgraph OS_DISK[" ALMACENAMIENTO PERSISTENTE (SSD / NVMe) - Bloques Binarios Inmutables "]
+        WAL["LSM Write-Ahead Log (WAL)<br/>Append-only secuencial al final del archivo<br/>(Para reconstruir la Memtable si hay corte de luz)"]
+        
+        subgraph SSTABLES_CASCADE[" SSTables en Cascada (Archivos Binarios Inmutables) "]
+            direction TB
+            subgraph L0[" Nivel L0 (Archivos descargados directos de RAM) "]
+                SST1["SSTable 1.db<br/>[Bloque A][Bloque B][Lápida Tombstone]"]
+                SST2["SSTable 2.db<br/>[Bloque C][Bloque D]"]
+            end
+            
+            subgraph L1[" Nivel L1 (Consolidados y sin solapamiento de rangos) "]
+                SST3["SSTable 3.db (Claves: a - m)"]
+                SST4["SSTable 4.db (Claves: n - z)"]
+            end
+        end
+        
+        Compactor["Hilo en Background: Compaction Engine<br/>Lee SSTables viejas, descarta duplicados/tombstones,<br/>y escribe una nueva SSTable fusionada (MergeSort)"]
+    end
+
+    %% Flujos de Escritura
+    Client -->|"1. Escribe clave:valor"| Memtable
+    Client -.->|"1.1 Append secuencial inmediato"| WAL
+    Memtable -->|"2. Al llenarse (Flush secuencial)"| L0
+
+    %% Flujos de Lectura
+    Client ==>|"A. Buscar clave: Primero en RAM"| Memtable
+    Client ==>|"B. Si no está en RAM, consultar"| BloomRam
+    BloomRam --"Dice 'NO'"--> Descartado["Evita I/O de disco (Ahorro crítico)"]
+    BloomRam --"Dice 'Tal vez'"--> SparseIdx
+    SparseIdx -->|"C. Salto exacto al offset del bloque"| SSTABLES_CASCADE
+
+    %% Flujo de Mantenimiento
+    L0 -->|"Fusiona y reordena"| Compactor
+    Compactor -->|"Genera nuevo archivo ordenado"| L1
+```
+
 * **Append-only log (Registro de solo adición):** El método más rápido para escribir en disco es ir agregando datos al final de un archivo sin modificar nada del pasado.
 * **Memtable (In-memory tree):** Cuando llega una escritura, en vez de ir directo a desordenar el disco, se guarda en RAM en un árbol ordenado (como un *Red-Black Tree* o *Skip List*). Así las escrituras son instantáneas y los datos están ordenados en memoria.
 * **SSTable (Sorted Strings Table):** Cuando la *Memtable* se llena (unos pocos megabytes), se descarga a disco de una sola pasada en forma de un archivo llamado SSTable. Su regla de oro: **está ordenado por clave y es inmutable** (nunca se modifica, solo se lee o se borra).
@@ -19,6 +70,60 @@ Pensada para cuando tienes **muchísimas escrituras** y no quieres ralentizar el
 
 ### 2. La Familia B-Tree y componentes
 El estándar histórico de la industria (desde 1970) y el pilar de las bases de datos relacionales tradicionales.
+
+```mermaid
+graph TD
+    subgraph CLIENT_LAYER_B[" Capa de Aplicación "]
+        ClientB["Cliente / API (Read / Write)"]
+    end
+
+    subgraph OS_RAM_B[" MEMORIA FÍSICA (RAM) - Buffer Pool / Page Cache "]
+        BufferPool["Buffer Pool (Gestor de Páginas en RAM)<br/>Mantiene copias de páginas de 4KB/8KB de disco"]
+        DirtyPages["Páginas Sucias (Dirty Pages)<br/>Modificadas en RAM pero aún no escritas a disco"]
+    end
+
+    subgraph OS_DISK_B[" ALMACENAMIENTO PERSISTENTE (SSD / NVMe) - Archivo de Datos Único "]
+        WAL_B["Write-Ahead Log (WAL / Redo Log)<br/>Registro previo secuencial y obligatorio antes de tocar una página"]
+        
+        subgraph BTREE_ON_DISK[" Estructura del Árbol en Páginas de Tamaño Fijo (4KB / 8KB) "]
+            RootPage["Página Raíz (Root Page)<br/>[Rango 0 - 500]"]
+            
+            subgraph INTERNAL_LEVEL[" Páginas Intermedias (Ramas) "]
+                IntPage1["Página Interior A<br/>[Rango 0 - 200]"]
+                IntPage2["Página Interior B<br/>[Rango 201 - 500]"]
+            end
+            
+            subgraph LEAF_LEVEL[" Páginas Hoja (Leaf Pages) - Datos Reales "]
+                Leaf1["Página Hoja 1<br/>[Claves 0 - 50 | Datos]"]
+                Leaf2["Página Hoja 2<br/>[Claves 51 - 200 | Datos]"]
+                Leaf3["Página Hoja 3<br/>[Claves 201 - 350 | Datos]"]
+                Leaf4["Página Hoja 4<br/>[Claves 351 - 500 | Datos]"]
+            end
+        end
+    end
+
+    %% Conexiones del Árbol
+    RootPage --> IntPage1
+    RootPage --> IntPage2
+    IntPage1 --> Leaf1
+    IntPage1 --> Leaf2
+    IntPage2 --> Leaf3
+    IntPage2 --> Leaf4
+    Leaf1 <== Sibling Pointers (Rango Scan Rápido) ==> Leaf2
+    Leaf2 <== Sibling Pointers ==> Leaf3
+    Leaf3 <== Sibling Pointers ==> Leaf4
+
+    %% Flujo de Lectura
+    ClientB ==>|"1. Lectura directa: Consulta página raíz"| BufferPool
+    BufferPool -->|"2. Atraviesa O(log N) páginas fijas"| RootPage
+    RootPage -.->|"3. Salto predictivo a la hoja exacta"| Leaf2
+
+    %% Flujo de Escritura
+    ClientB -->|"A. Modificar registro"| DirtyPages
+    DirtyPages -.->|"B. Paso Crítico: Escribe intención al WAL antes de tocar datos"| WAL_B
+    DirtyPages -->|"C. Checkpoint / Flush: Sobreescribe la página física en el sitio (Random Write)"| Leaf2
+    Leaf2 -.->|"D. Si la página se llena: PAGE SPLIT (Escribe 2 páginas nuevas y actualiza padre)"| IntPage1
+```
 
 * **Pages (Páginas / Bloques fijos):** En lugar de archivos de tamaño variable, el disco se divide en bloques fijos (típicamente 4 KiB, 8 KiB en Postgres, 16 KiB en MySQL).
 * **In-place update (Actualización en el lugar):** Si actualizas el saldo de un usuario, el motor busca la página exacta donde vive ese dato y **sobreescribe** esos bytes específicos en el disco.
