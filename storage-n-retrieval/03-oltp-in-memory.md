@@ -72,6 +72,74 @@ Como la RAM es físicamente volátil, si se desenchufa el servidor todo desapare
 3. **Replicación en memoria en tiempo real:**
    * La durabilidad no siempre se busca en el disco local: se envían los cambios a través de la red a una o más máquinas réplica en caliente.
 
+# Diferencia de rendimiento de escritura y lectura
+
+Para ver la diferencia física de rendimiento, imaginemos que queremos guardar y luego leer un objeto simple: un usuario con `id = 42` y un arreglo de compras: `[101, 204]`.
+
+---
+
+## 1. El Enfoque de Disco: Bloques y Páginas (Postgres, B-Trees)
+
+Los discos solo entienden secuencias rígidas de bytes empaquetados en bloques de tamaño fijo (ej. 8 KiB). 
+
+### Escritura (Serialización costosa)
+El motor no puede simplemente "soltar" el objeto en disco. Debe calcular cómo encajarlo en una página binaria:
+
+```text
+[ Encabezado de Página (Checksum, LSN, Free Space Offset: 0x01A0) ]
+[ Puntero de Item 1 (Offset: 8140) ][ Puntero de Item 2 (Offset: 8092) ]
+... (espacio vacío intermedio) ...
+[ Tuple Header (xmin, xmax, infomask, null_bitmap: 23 bytes) ]
+[ 0x0000002A ]           <-- id: 42 (entero de 4 bytes)
+[ 0x0002 ]               <-- Longitud del arreglo (2 elementos)
+[ 0x00000065, 0x000000CC ] <-- Datos del arreglo binario crudo
+```
+* **Costo:** La CPU gasta ciclos empaquetando bytes, alineando bits al ancho de palabra y recalculando punteros de *slots* dentro de la página.
+
+### Lectura (Deserialización)
+Para leer `compras[1]`:
+1. La CPU localiza la página de 8 KiB.
+2. Lee el encabezado, parsea el mapa de nulos (*null bitmap*).
+3. Suma el desplazamiento de bytes (*byte offset*) para saltar el encabezado y el `id`.
+4. Decodifica el binario crudo a un entero que el lenguaje de programación entienda.
+
+---
+
+## 2. El Enfoque In-Memory: Punteros Directos en RAM (Redis)
+
+En memoria pura no existen "páginas" ni "bloques de 8 KiB". Los datos viven como estructuras nativas del lenguaje (C/C++) enlazadas por **direcciones de memoria de 64 bits**.
+
+### Escritura (Sin serializar)
+El motor simplemente pide memoria al sistema operativo (`malloc`) y enlaza punteros:
+
+```c
+// Nodo en RAM en la dirección 0x7FFF0010
+struct User {
+    uint32_t id = 42;                 // 4 bytes directos en 0x7FFF0010
+    uint32_t *compras = 0x7FFF00A8;   // Puntero directo (8 bytes)
+};
+
+// Arreglo en la dirección 0x7FFF00A8
+[ 101, 204 ]  // Memoria contigua en RAM
+```
+* **Costo:** Casi cero. No se empaqueta nada en bloques; la CPU escribe las variables directamente en los transistores de la RAM.
+
+### Lectura (Un solo ciclo de CPU)
+Para leer `compras[1]`:
+1. La CPU lee la dirección `0x7FFF00A8`.
+2. Salta a `0x7FFF00A8 + sizeof(uint32_t)` en **1 ciclo de instrucción** (nanosegundos).
+3. No hay que decodificar encabezados de página, calcular offsets dinámicos ni parsear formatos binarios.
+
+---
+
+## Resumen Visual del Salto
+
+| Operación | En Disco (Bloques / Páginas) | En Memoria (Punteros Nativos) |
+| :--- | :--- | :--- |
+| **Cómo vive el dato** | Empaquetado en un bloque binario rígido de 4 u 8 KiB. | Instancia viva en C con punteros directos (`0x7FFF...`). |
+| **Paso de Escritura** | `Objeto` $\rightarrow$ Codificar a bytes $\rightarrow$ Alinear en página $\rightarrow$ Flush. | `Objeto` $\rightarrow$ Guardar directo en la dirección de RAM. |
+| **Paso de Lectura** | Parsear cabecera $\rightarrow$ Calcular offset $\rightarrow$ Deserializar binario. | **Seguir el puntero** en 1 instrucción de CPU. |
+
 ---
 
 ## Matriz Comparativa: Las Tres Familias de Motores OLTP
